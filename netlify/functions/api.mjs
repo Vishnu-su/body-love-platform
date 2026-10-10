@@ -75,6 +75,26 @@ export const handler = async (event) => {
         const cap = sessions.reduce((n, s) => n + s.capacity, 0), reserved = sessions.reduce((n, s) => n + s.reserved_count, 0);
         return json(200, { month, income_paid_mxn: sum(paymentsPaid, 'paid'), income_pending_mxn: sum(paymentsPending, 'pending'), expenses_paid_mxn: sum(expensesPaid, 'paid'), expenses_pending_mxn: sum(expensesPending, 'pending'), net_cashflow_mxn: sum(paymentsPaid, 'paid') - sum(expensesPaid, 'paid'), occupancy_pct: cap ? Math.round(reserved * 100 / cap) : 0, attendance_pct: attendance.length ? Math.round(attendance.filter((a) => a.attended).length * 100 / attendance.length) : 0 });
       }
+      if (event.httpMethod === 'GET' && route === '/admin/movements') {
+        const { start, end } = monthRange(event.queryStringParameters?.month);
+        const filter = new URLSearchParams({ select: 'id,description,amount_mxn,due_on,paid_at,method,status', due_on: `gte.${start}`, and: `(due_on.lt.${end})`, order: 'due_on.desc,created_at.desc', limit: '100' });
+        const [payments, expenses] = await Promise.all([db(`payments?${filter}`), db(`expenses?${filter}`)]);
+        const movements = [...(payments || []).map((x) => ({ ...x, direction: 'income' })), ...(expenses || []).map((x) => ({ ...x, direction: 'expense' }))].sort((a, b) => b.due_on.localeCompare(a.due_on));
+        return json(200, { movements });
+      }
+      if (event.httpMethod === 'GET' && route === '/admin/bookings') {
+        const q = new URLSearchParams({ select: 'id,status,created_at,session_id,members(full_name,phone),class_sessions(starts_at,fitness_classes(name)),attendance(attended,checked_at)', status: 'in.(pending_confirmation,confirmed,attended,no_show)', order: 'created_at.desc', limit: '100' });
+        return json(200, { bookings: await db(`bookings?${q}`) || [] });
+      }
+      if (event.httpMethod === 'POST' && route === '/admin/attendance') {
+        const body = parseBody(event);
+        if (!body) return fail('El cuerpo debe ser JSON válido.');
+        const { booking_id, attended, checked_by = 'Administración' } = body;
+        if (typeof booking_id !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(booking_id) || typeof attended !== 'boolean' || typeof checked_by !== 'string' || checked_by.length > 80) return fail('Datos de asistencia no válidos.');
+        const rows = await db('attendance?on_conflict=booking_id&select=id,booking_id,attended,checked_at', { method: 'POST', body: { booking_id, attended, checked_at: new Date().toISOString(), checked_by }, prefer: 'resolution=merge-duplicates,return=representation' });
+        await db(`bookings?id=eq.${booking_id}`, { method: 'PATCH', body: { status: attended ? 'attended' : 'no_show' }, prefer: 'return=minimal' });
+        return json(200, { attendance: rows?.[0] });
+      }
       if (event.httpMethod === 'POST' && route === '/admin/movements') {
         const body = parseBody(event);
         if (!body) return fail('El cuerpo debe ser JSON válido.');
