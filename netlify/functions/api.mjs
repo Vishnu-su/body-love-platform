@@ -32,7 +32,7 @@ const monthRange = (value) => {
 const sum = (rows, status) => (rows || []).filter((r) => !status || r.status === status).reduce((n, r) => n + Number(r.amount_mxn), 0);
 
 export const handler = async (event) => {
-  if (event.httpMethod === 'OPTIONS') return { statusCode: 204, headers: { 'access-control-allow-methods': 'GET,POST,OPTIONS', 'access-control-allow-headers': 'content-type,x-admin-key' }, body: '' };
+  if (event.httpMethod === 'OPTIONS') return { statusCode: 204, headers: { 'access-control-allow-methods': 'GET,POST,PATCH,OPTIONS', 'access-control-allow-headers': 'content-type,x-admin-key' }, body: '' };
   if (!configured) return json(503, { error: 'El servidor todavía no está conectado a Supabase.' });
   const route = (event.path || '').replace('/.netlify/functions/api', '').replace(/\/$/, '') || '/';
   try {
@@ -82,6 +82,25 @@ export const handler = async (event) => {
         const movements = [...(payments || []).map((x) => ({ ...x, direction: 'income' })), ...(expenses || []).map((x) => ({ ...x, direction: 'expense' }))].sort((a, b) => b.due_on.localeCompare(a.due_on));
         return json(200, { movements });
       }
+      if (event.httpMethod === 'GET' && route === '/admin/cashflow') {
+        const { month } = monthRange(event.queryStringParameters?.month);
+        const start = new Date(`${month}-01T00:00:00Z`);
+        start.setUTCMonth(start.getUTCMonth() - 5);
+        const from = start.toISOString().slice(0, 10);
+        const end = new Date(`${month}-01T00:00:00Z`);
+        end.setUTCMonth(end.getUTCMonth() + 1);
+        const to = end.toISOString().slice(0, 10);
+        const filters = new URLSearchParams({ select: 'amount_mxn,paid_at', status: 'eq.paid', paid_at: `gte.${from}T00:00:00Z`, and: `(paid_at.lt.${to}T00:00:00Z)`, limit: '1000' });
+        const [payments, expenses] = await Promise.all([db(`payments?${filters}`), db(`expenses?${filters}`)]);
+        const totals = Array.from({ length: 6 }, (_, i) => {
+          const date = new Date(start); date.setUTCMonth(date.getUTCMonth() + i);
+          const key = date.toISOString().slice(0, 7);
+          return { month: key, income_mxn: 0, expenses_mxn: 0 };
+        });
+        for (const row of payments || []) { const item = totals.find((x) => x.month === row.paid_at.slice(0, 7)); if (item) item.income_mxn += Number(row.amount_mxn); }
+        for (const row of expenses || []) { const item = totals.find((x) => x.month === row.paid_at.slice(0, 7)); if (item) item.expenses_mxn += Number(row.amount_mxn); }
+        return json(200, { months: totals });
+      }
       if (event.httpMethod === 'GET' && route === '/admin/bookings') {
         const q = new URLSearchParams({ select: 'id,status,created_at,session_id,members(full_name,phone),class_sessions(starts_at,fitness_classes(name)),attendance(attended,checked_at)', status: 'in.(pending_confirmation,confirmed,attended,no_show)', order: 'created_at.desc', limit: '100' });
         return json(200, { bookings: await db(`bookings?${q}`) || [] });
@@ -104,6 +123,20 @@ export const handler = async (event) => {
         const table = direction === 'income' ? 'payments' : 'expenses';
         const data = await db(`${table}?select=id,description,amount_mxn,due_on,method,status`, { method: 'POST', body: row, prefer: 'return=representation' });
         return json(201, { movement: data?.[0] });
+      }
+      if (event.httpMethod === 'PATCH' && /^\/admin\/movements\/(income|expense)\/[0-9a-f-]{36}$/i.test(route)) {
+        const body = parseBody(event);
+        if (!body) return fail('El cuerpo debe ser JSON válido.');
+        const [, direction, id] = route.match(/^\/admin\/movements\/(income|expense)\/([0-9a-f-]{36})$/i);
+        const { concept, amount_mxn, due_on, method, status } = body;
+        if (typeof concept !== 'string' || concept.trim().length < 2 || concept.length > 180 || !Number.isFinite(Number(amount_mxn)) || Number(amount_mxn) <= 0 || !/^\d{4}-\d{2}-\d{2}$/.test(due_on || '') || !['cash', 'card', 'transfer', 'other'].includes(method) || !['paid', 'pending'].includes(status)) return fail('Revisa concepto, importe, fecha, método y estado.');
+        const table = direction === 'income' ? 'payments' : 'expenses';
+        const existing = await db(`${table}?${new URLSearchParams({ select: 'id,status', id: `eq.${id}`, limit: '1' })}`);
+        if (!existing?.length) return json(404, { error: 'No encontramos ese movimiento.' });
+        const row = { description: concept.trim(), amount_mxn: Number(amount_mxn), due_on, method, status, paid_at: status === 'pending' ? null : (existing[0].status === 'paid' ? undefined : new Date().toISOString()) };
+        if (row.paid_at === undefined) delete row.paid_at;
+        const data = await db(`${table}?id=eq.${id}&select=id,description,amount_mxn,due_on,method,status,paid_at`, { method: 'PATCH', body: row, prefer: 'return=representation' });
+        return json(200, { movement: data?.[0] });
       }
     }
     return json(404, { error: 'Ruta no encontrada.' });
